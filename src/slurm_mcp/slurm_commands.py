@@ -638,6 +638,8 @@ class SlurmCommands:
             stderr_path=info.get('StdErr'),
             exit_code=int(info['ExitCode'].split(':')[0]) if info.get('ExitCode') else None,
             reason=info.get('Reason'),
+            comment=info.get('Comment') if info.get('Comment') and info.get('Comment') != '(null)' else None,
+            tres_per_node=info.get('TresPerNode') if info.get('TresPerNode') and info.get('TresPerNode') != '(null)' else None,
         )
     
     async def sbatch(self, script_path: str) -> int:
@@ -949,9 +951,10 @@ class SlurmCommands:
         gpus_per_node: Optional[int] = None,
         time_limit: Optional[str] = None,
         job_name: Optional[str] = None,
+        comment: Optional[str] = None,
     ) -> int:
         """Allocate resources and return job ID.
-        
+
         Args:
             partition: Partition to use.
             account: Account for billing.
@@ -959,31 +962,36 @@ class SlurmCommands:
             gpus_per_node: GPUs per node.
             time_limit: Time limit.
             job_name: Job name.
-            
+            comment: Slurm job comment string (used to persist session metadata).
+
         Returns:
             Allocated job ID.
-            
+
         Raises:
             SSHCommandError: If allocation fails.
         """
         cmd = "salloc --no-shell"
-        
+
         partition = partition or self.settings.interactive_partition
         account = account or self.settings.interactive_account
         time_limit = time_limit or self.settings.interactive_default_time
         gpus_per_node = gpus_per_node if gpus_per_node is not None else self.settings.interactive_default_gpus
-        
+
         if account:
             cmd += f" -A {account}"
         cmd += f" -p {partition}"
         cmd += f" -N {nodes}"
         cmd += f" -t {time_limit}"
-        
+
         if gpus_per_node:
             cmd += f" --gpus-per-node={gpus_per_node}"
-        
+
         if job_name:
             cmd += f" -J {job_name}"
+
+        if comment:
+            # Single-quote the value; our encoding (base64 + ':') contains no single quotes.
+            cmd += f" --comment='{comment}'"
         
         # salloc with --no-shell returns immediately with job ID
         result = await self.ssh.execute(cmd, timeout=120)
