@@ -1,45 +1,146 @@
-"""Interactive session manager for persistent Slurm allocations."""
+"""Interactive session manager for persistent Slurm allocations.
 
-import asyncio
+Sessions are NOT tracked in memory. Slurm is the source of truth:
+- ``salloc --no-shell`` creates the allocation; it survives the MCP server
+  going away (and the user's machine being powered off).
+- Job name encodes ``mcp-session-{session_id}``.
+- Job comment encodes per-session metadata (container image/mounts,
+  user-facing session name, gpus-per-node) as ``mcp:<base64-json>``.
+
+On every call we query ``squeue``/``scontrol`` and reconstruct
+``InteractiveSession`` objects, so restarting the MCP server (or running
+multiple servers) does not lose sessions.
+"""
+
+import base64
+import binascii
+import json
 import logging
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 from slurm_mcp.config import Settings
-from slurm_mcp.models import CommandResult, InteractiveSession
+from slurm_mcp.models import CommandResult, InteractiveSession, JobInfo
 from slurm_mcp.slurm_commands import SlurmCommands
 from slurm_mcp.ssh_client import SSHClient, SSHCommandError
 
 logger = logging.getLogger(__name__)
 
 
+SESSION_JOB_PREFIX = "mcp-session-"
+COMMENT_PREFIX = "mcp:"
+
+
+def _encode_metadata(metadata: dict) -> str:
+    """Encode session metadata for the Slurm job ``--comment`` field.
+
+    Compact JSON + base64 keeps the value free of whitespace and quotes,
+    so it round-trips cleanly through scontrol's ``Key=Value`` output.
+    """
+    raw = json.dumps(metadata, separators=(",", ":"), ensure_ascii=True)
+    encoded = base64.b64encode(raw.encode("ascii")).decode("ascii")
+    return f"{COMMENT_PREFIX}{encoded}"
+
+
+def _decode_metadata(comment: Optional[str]) -> dict:
+    if not comment or not comment.startswith(COMMENT_PREFIX):
+        return {}
+    payload = comment[len(COMMENT_PREFIX):]
+    try:
+        raw = base64.b64decode(payload.encode("ascii"), validate=True)
+        result = json.loads(raw.decode("utf-8"))
+        return result if isinstance(result, dict) else {}
+    except (binascii.Error, json.JSONDecodeError, UnicodeDecodeError):
+        logger.warning("Failed to decode session metadata from comment: %r", comment)
+        return {}
+
+
+def _gpus_per_node_from_job(job: JobInfo) -> Optional[int]:
+    """Best-effort extraction of GPUs-per-node from a Slurm job."""
+    if job.tres_per_node:
+        # Format: 'gres/gpu:4' or 'gres/gpu:a100:4'
+        for piece in job.tres_per_node.split(","):
+            piece = piece.strip()
+            if piece.startswith("gres/gpu"):
+                tail = piece.split(":")[-1]
+                if tail.isdigit():
+                    return int(tail)
+    if job.num_gpus and job.num_nodes:
+        per_node, remainder = divmod(job.num_gpus, job.num_nodes)
+        if remainder == 0 and per_node > 0:
+            return per_node
+    return None
+
+
+def _job_to_session(job: JobInfo, session_id: str) -> InteractiveSession:
+    """Reconstruct an InteractiveSession from a Slurm JobInfo."""
+    metadata = _decode_metadata(job.comment)
+    gpus_per_node = metadata.get("gpus_per_node")
+    if gpus_per_node is None:
+        gpus_per_node = _gpus_per_node_from_job(job)
+
+    status = "active" if job.state in ("RUNNING", "PENDING") else "ended"
+
+    return InteractiveSession(
+        session_id=session_id,
+        job_id=job.job_id,
+        session_name=metadata.get("session_name"),
+        partition=job.partition,
+        nodes=job.num_nodes,
+        gpus_per_node=gpus_per_node,
+        container_image=metadata.get("container_image"),
+        container_mounts=metadata.get("container_mounts"),
+        start_time=job.start_time or job.submit_time or datetime.now(),
+        time_limit=job.time_limit or "",
+        time_remaining=job.time_remaining,
+        status=status,
+        node_list=job.nodes,
+    )
+
+
+def _session_id_from_job_name(job_name: str) -> Optional[str]:
+    if not job_name or not job_name.startswith(SESSION_JOB_PREFIX):
+        return None
+    session_id = job_name[len(SESSION_JOB_PREFIX):]
+    return session_id or None
+
+
 class InteractiveSessionManager:
     """Manages persistent interactive Slurm sessions.
-    
-    This class handles the lifecycle of interactive sessions,
-    including creation, command execution, and cleanup.
+
+    All session state lives in Slurm (job name + ``--comment``). Methods
+    here are thin wrappers that query Slurm on demand.
     """
-    
+
     def __init__(
         self,
         ssh_client: SSHClient,
         slurm: SlurmCommands,
         settings: Settings,
     ):
-        """Initialize the interactive session manager.
-        
-        Args:
-            ssh_client: SSH client for remote operations.
-            slurm: Slurm commands wrapper.
-            settings: Configuration settings.
-        """
         self.ssh = ssh_client
         self.slurm = slurm
         self.settings = settings
-        self._sessions: dict[str, InteractiveSession] = {}
-        self._lock = asyncio.Lock()
-    
+
+    async def _find_job_for_session(self, session_id: str) -> Optional[JobInfo]:
+        """Locate the Slurm job backing a given session_id, if still alive."""
+        job_name = f"{SESSION_JOB_PREFIX}{session_id}"
+        # squeue -n filters by exact name. Restrict to our user to keep it cheap.
+        cmd = f"squeue -h -u {self.settings.ssh_user} -n {job_name} -o '%i'"
+        result = await self.ssh.execute(cmd)
+        if not result.success:
+            logger.debug("squeue for session %s failed: %s", session_id, result.stderr)
+            return None
+        line = result.stdout.strip().splitlines()[:1]
+        if not line:
+            return None
+        try:
+            job_id = int(line[0].strip().split("_")[0])
+        except ValueError:
+            return None
+        return await self.slurm.get_job_details(job_id)
+
     async def start_session(
         self,
         session_name: Optional[str] = None,
@@ -53,38 +154,31 @@ class InteractiveSessionManager:
         no_container_mount_home: bool = True,
     ) -> InteractiveSession:
         """Start a new interactive session.
-        
-        Args:
-            session_name: Optional name for the session.
-            partition: Partition to use.
-            account: Account for billing.
-            nodes: Number of nodes.
-            gpus_per_node: GPUs per node.
-            time_limit: Time limit.
-            container_image: Container image path.
-            container_mounts: Container mounts.
-            no_container_mount_home: Don't mount home in container.
-            
-        Returns:
-            InteractiveSession object.
-            
-        Raises:
-            SSHCommandError: If session creation fails.
+
+        Resources are allocated via ``salloc --no-shell``; the allocation
+        survives MCP server restarts. Session metadata is stored in the
+        Slurm job comment so it can be recovered later.
         """
         session_id = str(uuid.uuid4())[:8]
-        job_name = f"mcp-session-{session_id}"
-        
-        # Use defaults from settings if not provided
+        job_name = f"{SESSION_JOB_PREFIX}{session_id}"
+
         partition = partition or self.settings.interactive_partition
         account = account or self.settings.interactive_account
         time_limit = time_limit or self.settings.interactive_default_time
         if gpus_per_node is None:
             gpus_per_node = self.settings.interactive_default_gpus
         container_mounts = container_mounts or self.settings.get_container_mounts()
-        
-        logger.info(f"Starting interactive session {session_id} on partition {partition}")
-        
-        # Allocate resources
+
+        metadata = {
+            "session_name": session_name,
+            "container_image": container_image,
+            "container_mounts": container_mounts,
+            "gpus_per_node": gpus_per_node,
+        }
+        comment = _encode_metadata({k: v for k, v in metadata.items() if v is not None})
+
+        logger.info("Starting interactive session %s on partition %s", session_id, partition)
+
         job_id = await self.slurm.salloc(
             partition=partition,
             account=account,
@@ -92,35 +186,30 @@ class InteractiveSessionManager:
             gpus_per_node=gpus_per_node,
             time_limit=time_limit,
             job_name=job_name,
+            comment=comment,
         )
-        
-        logger.info(f"Session {session_id} allocated job {job_id}")
-        
-        # Get allocated nodes
+
+        logger.info("Session %s allocated job %s", session_id, job_id)
+
         job_info = await self.slurm.get_job_details(job_id)
-        node_list = job_info.nodes if job_info else None
-        
-        # Create session object
-        session = InteractiveSession(
-            session_id=session_id,
-            job_id=job_id,
-            session_name=session_name,
-            partition=partition,
-            nodes=nodes,
-            gpus_per_node=gpus_per_node,
-            container_image=container_image,
-            container_mounts=container_mounts,
-            start_time=datetime.now(),
-            time_limit=time_limit,
-            status="active",
-            node_list=node_list,
-        )
-        
-        async with self._lock:
-            self._sessions[session_id] = session
-        
-        return session
-    
+        if job_info is None:
+            # Allocation succeeded but we cannot inspect it; build a minimal record.
+            return InteractiveSession(
+                session_id=session_id,
+                job_id=job_id,
+                session_name=session_name,
+                partition=partition,
+                nodes=nodes,
+                gpus_per_node=gpus_per_node,
+                container_image=container_image,
+                container_mounts=container_mounts,
+                start_time=datetime.now(),
+                time_limit=time_limit,
+                status="active",
+            )
+
+        return _job_to_session(job_info, session_id)
+
     async def exec_command(
         self,
         session_id: str,
@@ -128,31 +217,17 @@ class InteractiveSessionManager:
         working_directory: Optional[str] = None,
         timeout: Optional[int] = None,
     ) -> CommandResult:
-        """Execute a command in an existing session.
-        
-        Args:
-            session_id: Session ID.
-            command: Command to execute.
-            working_directory: Working directory.
-            timeout: Command timeout.
-            
-        Returns:
-            CommandResult with output.
-            
-        Raises:
-            ValueError: If session not found.
-            SSHCommandError: If command fails.
-        """
+        """Execute a command in an existing session."""
         session = await self.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
-        
+
         if session.status != "active":
             raise ValueError(f"Session {session_id} is not active (status: {session.status})")
-        
-        logger.debug(f"Executing command in session {session_id}: {command[:50]}...")
-        
-        result = await self.slurm.srun_in_allocation(
+
+        logger.debug("Executing command in session %s: %s...", session_id, command[:50])
+
+        return await self.slurm.srun_in_allocation(
             job_id=session.job_id,
             command=command,
             container_image=session.container_image,
@@ -160,116 +235,53 @@ class InteractiveSessionManager:
             working_directory=working_directory,
             timeout=timeout,
         )
-        
-        # Update last command time
-        async with self._lock:
-            if session_id in self._sessions:
-                self._sessions[session_id].last_command_time = datetime.now()
-        
-        return result
-    
+
     async def end_session(self, session_id: str) -> bool:
-        """End an interactive session.
-        
-        Args:
-            session_id: Session ID to end.
-            
-        Returns:
-            True if session was ended successfully.
-        """
-        async with self._lock:
-            if session_id not in self._sessions:
-                return False
-            
-            session = self._sessions[session_id]
-        
-        logger.info(f"Ending session {session_id} (job {session.job_id})")
-        
-        # Cancel the allocation
-        success = await self.slurm.scancel(session.job_id)
-        
-        async with self._lock:
-            if session_id in self._sessions:
-                self._sessions[session_id].status = "ended"
-                del self._sessions[session_id]
-        
-        return success
-    
+        """End an interactive session by cancelling its Slurm allocation."""
+        job = await self._find_job_for_session(session_id)
+        if job is None:
+            return False
+
+        logger.info("Ending session %s (job %s)", session_id, job.job_id)
+        return await self.slurm.scancel(job.job_id)
+
     async def get_session(self, session_id: str) -> Optional[InteractiveSession]:
-        """Get session info and verify it's still active.
-        
-        Args:
-            session_id: Session ID.
-            
-        Returns:
-            InteractiveSession or None if not found.
-        """
-        async with self._lock:
-            if session_id not in self._sessions:
-                return None
-            
-            session = self._sessions[session_id]
-        
-        # Verify the job is still running
-        job_info = await self.slurm.get_job_details(session.job_id)
-        
-        if not job_info or job_info.state not in ['RUNNING', 'PENDING']:
-            # Session has ended
-            async with self._lock:
-                if session_id in self._sessions:
-                    self._sessions[session_id].status = "ended"
-                    del self._sessions[session_id]
+        """Get session info from Slurm, or None if the allocation is gone."""
+        job = await self._find_job_for_session(session_id)
+        if job is None or job.state not in ("RUNNING", "PENDING"):
             return None
-        
-        # Update time remaining
-        if job_info.time_remaining:
-            async with self._lock:
-                if session_id in self._sessions:
-                    self._sessions[session_id].time_remaining = job_info.time_remaining
-                    session = self._sessions[session_id]
-        
-        return session
-    
+        return _job_to_session(job, session_id)
+
     async def list_sessions(self) -> list[InteractiveSession]:
-        """List all active sessions.
-        
-        Returns:
-            List of active sessions.
-        """
-        # Refresh all sessions
-        sessions = []
-        session_ids = list(self._sessions.keys())
-        
-        for session_id in session_ids:
-            session = await self.get_session(session_id)
-            if session:
-                sessions.append(session)
-        
+        """List all active interactive sessions for the current user."""
+        # Fetch only this user's jobs; filter by our naming convention.
+        cmd = f"squeue -h -u {self.settings.ssh_user} -o '%i|%j'"
+        result = await self.ssh.execute(cmd)
+        if not result.success:
+            logger.error("squeue failed while listing sessions: %s", result.stderr)
+            return []
+
+        session_jobs: list[tuple[int, str]] = []
+        for line in result.stdout.strip().splitlines():
+            if "|" not in line:
+                continue
+            jid_raw, name = line.split("|", 1)
+            session_id = _session_id_from_job_name(name.strip())
+            if not session_id:
+                continue
+            try:
+                job_id = int(jid_raw.strip().split("_")[0])
+            except ValueError:
+                continue
+            session_jobs.append((job_id, session_id))
+
+        sessions: list[InteractiveSession] = []
+        for job_id, session_id in session_jobs:
+            details = await self.slurm.get_job_details(job_id)
+            if details and details.state in ("RUNNING", "PENDING"):
+                sessions.append(_job_to_session(details, session_id))
         return sessions
-    
-    async def cleanup_stale_sessions(self) -> int:
-        """Remove sessions that have ended or timed out.
-        
-        Returns:
-            Number of sessions cleaned up.
-        """
-        cleaned = 0
-        session_ids = list(self._sessions.keys())
-        
-        for session_id in session_ids:
-            session = await self.get_session(session_id)
-            if not session:
-                cleaned += 1
-            elif session.last_command_time:
-                # Check for idle timeout
-                idle_seconds = (datetime.now() - session.last_command_time).total_seconds()
-                if idle_seconds > self.settings.interactive_session_timeout:
-                    logger.info(f"Session {session_id} timed out after {idle_seconds}s idle")
-                    await self.end_session(session_id)
-                    cleaned += 1
-        
-        return cleaned
-    
+
     async def run_command(
         self,
         command: str,
@@ -285,25 +297,9 @@ class InteractiveSessionManager:
         timeout: Optional[int] = None,
     ) -> CommandResult:
         """Execute a single command with interactive resources (one-shot).
-        
+
         This allocates resources, runs the command, and releases resources.
         No persistent session is created.
-        
-        Args:
-            command: Command to execute.
-            partition: Partition to use.
-            account: Account for billing.
-            nodes: Number of nodes.
-            gpus_per_node: GPUs per node.
-            time_limit: Time limit.
-            container_image: Container image path.
-            container_mounts: Container mounts.
-            no_container_mount_home: Don't mount home in container.
-            working_directory: Working directory.
-            timeout: Command timeout.
-            
-        Returns:
-            CommandResult with output.
         """
         return await self.slurm.srun_command(
             command=command,
@@ -320,7 +316,6 @@ class InteractiveSessionManager:
         )
 
 
-# Global session manager instance
 _session_manager: Optional[InteractiveSessionManager] = None
 
 
@@ -329,35 +324,22 @@ def get_session_manager(
     slurm: Optional[SlurmCommands] = None,
     settings: Optional[Settings] = None,
 ) -> InteractiveSessionManager:
-    """Get or create the global session manager instance.
-    
-    Args:
-        ssh_client: SSH client (required on first call).
-        slurm: Slurm commands wrapper (required on first call).
-        settings: Settings (required on first call).
-        
-    Returns:
-        InteractiveSessionManager instance.
-    """
+    """Get or create the global session manager instance."""
     global _session_manager
-    
+
     if _session_manager is None:
         if ssh_client is None or slurm is None or settings is None:
             raise ValueError("ssh_client, slurm, and settings required on first call")
         _session_manager = InteractiveSessionManager(ssh_client, slurm, settings)
-    
+
     return _session_manager
 
 
 async def reset_session_manager() -> None:
-    """Reset the global session manager."""
+    """Drop the cached session manager instance.
+
+    Slurm allocations are not touched: they persist independently and can be
+    recovered by any subsequent session manager.
+    """
     global _session_manager
-    
-    if _session_manager is not None:
-        # End all active sessions
-        for session_id in list(_session_manager._sessions.keys()):
-            try:
-                await _session_manager.end_session(session_id)
-            except Exception:
-                pass
-        _session_manager = None
+    _session_manager = None

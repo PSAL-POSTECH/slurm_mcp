@@ -121,6 +121,8 @@ class JobInfo(BaseModel):
     container_image: Optional[str] = Field(default=None, description="Container image used")
     exit_code: Optional[int] = Field(default=None, description="Exit code (if completed)")
     reason: Optional[str] = Field(default=None, description="Reason for pending/failed state")
+    comment: Optional[str] = Field(default=None, description="Slurm job comment (used to carry session metadata)")
+    tres_per_node: Optional[str] = Field(default=None, description="TRES per node (e.g., 'gres/gpu:4')")
 
 
 class JobSubmission(BaseModel):
