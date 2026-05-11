@@ -59,11 +59,16 @@ def create_mcp_json(
     command: str = "slurm-mcp"
 ) -> dict:
     """Create an mcp.json structure from environment variables."""
+    env_with_utf8 = {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        **env_vars,
+    }
     return {
         "mcpServers": {
             server_name: {
                 "command": command,
-                "env": env_vars
+                "env": env_with_utf8
             }
         }
     }

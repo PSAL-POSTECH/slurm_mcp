@@ -159,6 +159,8 @@ Options:
     "slurm": {
       "command": "slurm-mcp",
       "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
         "SLURM_SSH_HOST": "login.cluster.example.com",
         "SLURM_SSH_USER": "username",
         "SLURM_SSH_KEY_PATH": "~/.ssh/id_rsa",
@@ -200,6 +202,8 @@ If you have already configured a `.env` file in the project directory:
       "command": "python",
       "args": ["/path/to/slurm_mcp/src/slurm_mcp/server.py"],
       "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
         "SLURM_SSH_HOST": "login.cluster.example.com",
         "SLURM_SSH_USER": "username",
         "SLURM_SSH_KEY_PATH": "~/.ssh/id_rsa",
@@ -233,6 +237,8 @@ Add to your Claude Desktop config file:
     "slurm": {
       "command": "slurm-mcp",
       "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
         "SLURM_SSH_HOST": "login.cluster.example.com",
         "SLURM_SSH_USER": "username",
         "SLURM_SSH_KEY_PATH": "~/.ssh/id_rsa",
