@@ -1098,6 +1098,44 @@ async def delete_file(
 
 
 @mcp.tool()
+async def download_file(
+    path: Annotated[str, Field(description="Remote file or directory path on the cluster")],
+    directory_type: Annotated[Optional[str], Field(description="Base directory type for resolving 'path' (e.g., 'results', 'logs')")] = None,
+    local_path: Annotated[Optional[str], Field(description="Local destination path. Defaults to ~/Downloads/<filename>. If a directory, the file is placed inside with its remote name.")] = None,
+    recursive: Annotated[bool, Field(description="Required when downloading a directory")] = False,
+    overwrite: Annotated[bool, Field(description="Overwrite if local path already exists")] = False,
+) -> str:
+    """Download a file (or directory, with recursive=True) from the cluster to the local machine.
+
+    By default the file is saved to the user's ~/Downloads folder.
+    """
+    try:
+        _, _, _, _, _, directories = await get_instances()
+
+        result = await directories.download(
+            path=path,
+            directory_type=directory_type,
+            local_path=local_path,
+            recursive=recursive,
+            overwrite=overwrite,
+        )
+
+        from slurm_mcp.directories import _bytes_to_human
+        size_human = _bytes_to_human(result["bytes"])
+
+        return (
+            f"Downloaded {result['files']} file(s) ({size_human})\n"
+            f"  From: {result['remote_path']}\n"
+            f"  To:   {result['local_path']}"
+        )
+
+    except FileExistsError as e:
+        raise ToolError(str(e))
+    except Exception as e:
+        raise ToolError(f"Failed to download: {e}")
+
+
+@mcp.tool()
 async def get_disk_usage(
     directory_type: Annotated[Optional[str], Field(description="Check specific directory type")] = None,
     path: Annotated[Optional[str], Field(description="Check specific path")] = None,

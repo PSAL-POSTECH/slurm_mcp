@@ -327,6 +327,7 @@ SLURM_SSH_HOST=login.example.com SLURM_SSH_USER=user slurm-mcp
 | `list_job_logs` | List job log files |
 | `read_file` | Read file contents |
 | `write_file` | Write to a file |
+| `download_file` | Download a remote file/dir to local `~/Downloads` |
 | `find_files` | Search for files |
 | `delete_file` | Delete file or directory |
 | `get_disk_usage` | Check disk usage |
