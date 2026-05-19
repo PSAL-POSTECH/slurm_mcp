@@ -613,6 +613,63 @@ class DirectoryManager:
         else:
             await self.ssh.delete_file(full_path)
     
+    async def download(
+        self,
+        path: str,
+        directory_type: Optional[str] = None,
+        local_path: Optional[str] = None,
+        recursive: bool = False,
+        overwrite: bool = False,
+    ) -> dict:
+        """Download a file or directory from the cluster to the local machine.
+
+        Args:
+            path: Remote path to download.
+            directory_type: Base directory type for resolving ``path``.
+            local_path: Local destination. If omitted, saves to ``~/Downloads/<name>``.
+                If a directory, the remote item is placed inside it with its
+                original name.
+            recursive: Required when downloading a directory.
+            overwrite: If False, refuse to overwrite an existing local file.
+
+        Returns:
+            Dictionary with: ``local_path``, ``remote_path``, ``bytes``, ``files``.
+        """
+        remote_full = self.resolve_path(path, directory_type)
+        name = Path(remote_full).name
+
+        if local_path:
+            local = Path(local_path).expanduser()
+            if local.is_dir():
+                local = local / name
+        else:
+            local = Path.home() / "Downloads" / name
+
+        if local.exists() and not overwrite:
+            raise FileExistsError(
+                f"Local path already exists: {local} (set overwrite=True to replace)"
+            )
+
+        if local.exists() and overwrite:
+            if local.is_dir():
+                import shutil
+                shutil.rmtree(local)
+            else:
+                local.unlink()
+
+        stats = await self.ssh.download_file(
+            remote_path=remote_full,
+            local_path=str(local),
+            recursive=recursive,
+        )
+
+        return {
+            "local_path": str(local),
+            "remote_path": remote_full,
+            "bytes": stats["bytes"],
+            "files": stats["files"],
+        }
+
     async def get_disk_usage(
         self,
         directory_type: Optional[str] = None,

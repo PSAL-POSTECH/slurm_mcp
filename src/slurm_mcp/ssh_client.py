@@ -417,6 +417,59 @@ class SSHClient:
             except asyncssh.Error as e:
                 raise SSHCommandError(f"Failed to delete directory {remote_path}: {e}") from e
     
+    async def download_file(
+        self,
+        remote_path: str,
+        local_path: str,
+        recursive: bool = False,
+    ) -> dict:
+        """Download a file or directory from the remote host via SFTP.
+
+        Args:
+            remote_path: Path on the remote host.
+            local_path: Destination path on the local filesystem.
+            recursive: If True, download directories recursively.
+
+        Returns:
+            Dictionary with download stats: ``{"bytes": int, "files": int}``.
+
+        Raises:
+            SSHCommandError: If download fails.
+        """
+        await self.ensure_connected()
+
+        try:
+            async with self._connection.start_sftp_client() as sftp:
+                attrs = await sftp.stat(remote_path)
+                is_dir = attrs.type == asyncssh.FILEXFER_TYPE_DIRECTORY
+
+                if is_dir and not recursive:
+                    raise SSHCommandError(
+                        f"{remote_path} is a directory; pass recursive=True to download it"
+                    )
+
+                local = Path(local_path).expanduser()
+                local.parent.mkdir(parents=True, exist_ok=True)
+
+                await sftp.get(remote_path, str(local), recurse=recursive, preserve=True)
+
+            total_bytes = 0
+            file_count = 0
+            if local.is_dir():
+                for p in local.rglob("*"):
+                    if p.is_file():
+                        total_bytes += p.stat().st_size
+                        file_count += 1
+            elif local.is_file():
+                total_bytes = local.stat().st_size
+                file_count = 1
+
+            logger.debug(f"Downloaded {file_count} file(s) ({total_bytes} bytes) to {local}")
+            return {"bytes": total_bytes, "files": file_count}
+
+        except asyncssh.Error as e:
+            raise SSHCommandError(f"Failed to download {remote_path}: {e}") from e
+
     async def get_file_info(self, remote_path: str) -> dict:
         """Get information about a file or directory.
         
