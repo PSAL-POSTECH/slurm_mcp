@@ -138,6 +138,35 @@ Options:
 - `--server-name NAME` - Custom server name (default: "slurm")
 - `--command CMD` - Custom command (default: "slurm-mcp")
 
+## Launch Claude inside a Slurm job
+
+`scripts/claude-slurm-session.sh` starts `claude remote-control` inside a
+running Slurm allocation, wrapped in a tmux session on the login node so the
+Claude process survives SSH drops. Run it on a login node:
+
+```bash
+# Attach Claude to a running job (uses container settings from job metadata
+# if the job was created by slurm_mcp; otherwise runs bare):
+./scripts/claude-slurm-session.sh 12345
+
+# With an explicit name and container:
+./scripts/claude-slurm-session.sh 12345 \
+  --name myexp \
+  --container-image /lustre/users/me/images/pytorch.sqsh
+
+# Force bare execution even if the job has container metadata:
+./scripts/claude-slurm-session.sh 12345 --no-container
+```
+
+The script prints a `https://claude.ai/code/...` URL — open it in the browser
+or the Claude mobile app to drive Claude inside the allocation. To debug or
+type directly, attach to the tmux session shown in the output.
+
+Prerequisites: `tmux` on the login node, `claude` CLI available in the
+execution environment, `~/.claude` credentials visible there (HPC home mounts
+usually carry these into containers), and outbound HTTPS to the Anthropic API
+allowed from the compute node.
+
 ## Usage with MCP Clients
 
 ### Cursor IDE Setup
